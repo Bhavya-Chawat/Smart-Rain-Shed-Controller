@@ -1,0 +1,556 @@
+// =========================== CONFIG & LIBRARIES ===========================
+// Project: Smart Rain Shed Controller (Testing & Simulation Build)
+// By: Bhavya Chawat and Team
+// --------------------------------------------------------------------------
+#define BLYNK_TEMPLATE_ID      "TMPL3JKDmJBIr"
+#define BLYNK_TEMPLATE_NAME    "Rain Shed Controller"
+#define BLYNK_AUTH_TOKEN       "rfNBbrarl5diKdFoBvtmZy9QgpIKtPoT"
+
+#define TEST_MODE 1   // <<< 1 = simulation/testing, 0 = real sensors
+
+#include <WiFi.h>
+#include <BlynkSimpleEsp32.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <time.h>
+#include <esp_task_wdt.h>
+
+// === GOOGLE SHEETS LOGGING URL ===
+const char* sheetURL = "https://script.google.com/macros/s/AKfycbyP8GyDlxRpNCE-AaNlr8rFX0-Mm7q40Hxfrd0W5y1piHH9Fy-71kRVov2Rx8xMJXQoEg/exec";
+
+// ========================== WIFI CREDENTIALS ==============================
+char ssid[] = "Bhavya";
+char pass[] = "@password420";
+
+// ========================== API & LOCATION SETTINGS ========================
+const char* tomorrowAPIKey = "tomtVBYLLe1EZ9Km3dLXWQ8DYMGCbi9P";
+float latitude = 12.9716, longitude = 77.5946;
+char weatherCondition[16] = "Init";
+char lastWeatherCondition[16] = "";
+
+// ========================== LCD OBJECT ====================================
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+
+// ========================== GPIO DEFINITIONS ==============================
+#define RAIN_SENSOR_PIN   34
+#define LDR_SENSOR_PIN    35
+#define SWITCH_PIN        25
+#define MOTOR_IN1         26
+#define MOTOR_IN2         27
+#define RAIN_ANALOG_PIN   36    // Analog rain sensor
+
+// ========================== BLYNK VIRTUAL PINS ============================
+// Control, state, and telemetry pin layout for Blynk & cloud UI
+#define VPIN_MANUAL_MODE      V0   // Toggle Auto/Manual Mode (Switch)
+#define VPIN_SHED_STATUS      V1   // Read: Open/Closed (Label)
+#define VPIN_RAIN_STATUS      V2   // Read: Rain Detected/No Rain (Label)
+#define VPIN_LIGHT_STATUS     V3   // Read: Bright/Dark (Label)
+#define VPIN_MANUAL_OPEN      V4   // Button: Manual Open
+#define VPIN_MANUAL_CLOSE     V5   // Button: Manual Close
+#define VPIN_WEATHER_STATUS   V6   // Read: Weather from API (Label)
+#define VPIN_START_HOUR       V7   // Number input/Slider: Auto Start Hour (0-23)
+#define VPIN_END_HOUR         V8   // Number input/Slider: Auto End Hour (0-23)
+#define VPIN_RAIN_INTENSITY   V9   // Analog rain sensor intensity (%) [0-100]
+
+// ========================== TIME SUPPORT ==================================
+struct tm timeinfo;
+int startHour = 6, endHour = 20;
+
+// ========================== STATE & ENUMS =================================
+enum ShedState { IDLE, OPENING, CLOSING };
+ShedState shedState = IDLE;
+
+// ------------ Core State Variables -------------------------
+bool shedOpen = true;
+bool manualMode = false;      // Default:auto (manual=false)
+bool lcdStarted = false;
+bool prevWiFiStatus = true, prevBlynkStatus = true;
+unsigned long motorStartTime = 0, lastMotorActionTime = 0;
+const unsigned long motorRunDuration = 7000;
+const unsigned long motorCooldown = 3000;
+unsigned long startupTime;
+bool pendingUpdate = false;
+bool lastManualMode = false, lastShedOpen = true;
+int lastRainVal = -1, lastLightVal = -1;
+bool lastTimeWindowStatus = true;
+BlynkTimer timer;
+
+// Debounce/auto throttling
+bool rainCheckActive = false;
+unsigned long rainCheckStart = 0;
+const unsigned long rainCheckDuration = 5000;
+unsigned long autoModeLastCheck = 0;
+const unsigned long autoCheckInterval = 2000;
+
+// LCD failsafe/banners
+bool lcdFailNotified = false;
+static unsigned long lastLoopTime = 0;
+
+// =================== TEST/SIMULATION OVERRIDES ===========================
+#if TEST_MODE
+int fakeRainDigital = 1;      // 0 = "Rain Detected", 1 = "No Rain"
+int fakeLdr = 0;              // 0 = "Bright", 1 = "Dark"
+int fakeRainAnalog = 2000;    // 0~4095. Map(3500, 500) to 0~100%
+int digitalReadOrig(int pin) { return ::digitalRead(pin); }
+int analogReadOrig(int pin)  { return ::analogRead(pin); }
+#undef digitalRead
+#undef analogRead
+#define digitalRead(PIN) \
+  (PIN == RAIN_SENSOR_PIN ? fakeRainDigital : \
+  (PIN == LDR_SENSOR_PIN ? fakeLdr : digitalReadOrig(PIN)))
+#define analogRead(PIN) \
+  (PIN == RAIN_ANALOG_PIN ? fakeRainAnalog : analogReadOrig(PIN))
+void serialTestControl() {
+    if (Serial.available()) {
+        String cmd = Serial.readStringUntil('\n'); cmd.trim();
+        if (cmd.startsWith("rain ")) {
+            fakeRainDigital = cmd.substring(5).toInt();
+            Serial.print("[TEST] Digital Rain: "); Serial.println(fakeRainDigital ? "No Rain" : "Rain Detected");
+        }
+        if (cmd.startsWith("ldr ")) {
+            fakeLdr = cmd.substring(4).toInt();
+            Serial.print("[TEST] LDR: "); Serial.println(fakeLdr ? "Dark" : "Bright");
+        }
+        if (cmd.startsWith("intensity ")) {
+            fakeRainAnalog = cmd.substring(10).toInt();
+            Serial.print("[TEST] Rain Intensity (ADC): "); Serial.println(fakeRainAnalog);
+        }
+    }
+}
+#endif
+
+// ========================== HELPER FUNCTIONS ==============================
+
+const char* getRainStatus() { return digitalRead(RAIN_SENSOR_PIN) == 0 ? "Rain Detected" : "No Rain"; }
+const char* getLightStatus() { return digitalRead(LDR_SENSOR_PIN) == 0 ? "Bright" : "Dark"; }
+bool isWeatherAPIRain() {
+    return strcmp(weatherCondition, "HvRain") == 0 ||
+           strcmp(weatherCondition, "LtRain") == 0 ||
+           strcmp(weatherCondition, "Drzl") == 0;
+}
+const char* getWeatherDescription(int code) {
+    switch (code) {
+        case 1000: return "Clear";
+        case 1001: return "Cloudy";
+        case 4200: return "LtRain";
+        case 4201: return "HvRain";
+        case 4000: return "Drzl";
+        case 5000: return "Snow";
+        case 5100: return "LtSnow";
+        case 6000: return "FrzDrz";
+        default:   return "Unknown";
+    }
+}
+void logEvent(const char *event, const char *msg) {
+    Blynk.logEvent(event, msg);
+    Serial.printf("[BLYNK] %s\n", msg);
+}
+bool isWiFiConnected() { return WiFi.status() == WL_CONNECTED; }
+bool isBlynkConnected() { return Blynk.connected(); }
+void updateBlynkIfChanged(int vpin, char* prev, const char* current) {
+    if (strcmp(prev, current) != 0) {
+        Blynk.virtualWrite(vpin, current);
+        strncpy(prev, current, 15);
+        prev[15] = '\0';
+    }
+}
+const char* resetReasonToText(int reason) {
+    switch (reason) {
+        case 1: return "POWERON_RESET";
+        case 3: return "SW_RESET";
+        case 4: return "WDT_RESET";
+        default: return "Other";
+    }
+}
+// ======== Google Sheets Logging Support ==========
+String getTimestamp() {
+    if (getLocalTime(&timeinfo))
+        return String(timeinfo.tm_year+1900) + "-" + String(timeinfo.tm_mon+1) + "-" +
+               String(timeinfo.tm_mday) + " " + String(timeinfo.tm_hour) + ":" +
+               String(timeinfo.tm_min) + ":" + String(timeinfo.tm_sec);
+    else
+        return String(millis()/1000) + "s";
+}
+void logToGoogleSheets(const char* rainStatus, const char* lightStatus, const char* weather,
+                       const char* shedState, const char* mode, const char* event)
+{
+    if(WiFi.status() != WL_CONNECTED) {
+        Serial.println("[G-SHEET] WiFi not connected, cannot log!");
+        return;
+    }
+    String payload = "{";
+    payload += "\"timestamp\":\"" + getTimestamp() + "\",";
+    payload += "\"rain_status\":\"" + String(rainStatus) + "\",";
+    payload += "\"ldr_status\":\"" + String(lightStatus) + "\",";
+    payload += "\"weather\":\"" + String(weather) + "\",";
+    payload += "\"shed_state\":\"" + String(shedState) + "\",";
+    payload += "\"mode\":\"" + String(mode) + "\",";
+    payload += "\"event\":\"" + String(event ? event : "") + "\"";
+    payload += "}";
+    HTTPClient http;
+    http.begin(sheetURL);
+    http.addHeader("Content-Type", "application/json");
+    int httpCode = http.POST(payload);
+    if(httpCode == 200) {
+        Serial.println("[G-SHEET] Log Success");
+    } else {
+        Serial.printf("[G-SHEET] Log Fail: %d\n", httpCode);
+    }
+    http.end();
+}
+int readRainAnalog() { return analogRead(RAIN_ANALOG_PIN); }
+int getRainPercent() {
+    int val = readRainAnalog();
+    int percent = map(val, 3500, 500, 0, 100);
+    if (percent < 0) percent = 0;
+    if (percent > 100) percent = 100;
+    return percent;
+}
+
+// ========================== SETUP FUNCTIONS ===============================
+void setupWiFi() {
+    WiFi.begin(ssid, pass);
+    int retries = 0;
+    Serial.print("[WIFI] Connecting ");
+    while (WiFi.status() != WL_CONNECTED && retries < 20) {
+        delay(500);
+        Serial.print(".");
+        retries++;
+    }
+    Serial.println(WiFi.status() == WL_CONNECTED ? " CONNECTED!" : " FAILED!");
+}
+void setupBlynk() {
+    Blynk.config(BLYNK_AUTH_TOKEN);
+    Blynk.connect(5000);
+    Serial.println("[BLYNK] Initialization complete.");
+}
+void setupLCD() {
+    lcd.init();
+    lcd.backlight();
+    lcd.clear();
+    lcd.setCursor(0, 0); lcd.print("  Rain Shed  ");
+    lcd.setCursor(0, 1); lcd.print("   Controller   ");
+    delay(1200);
+    lcd.clear();
+    lcd.setCursor(3,0); lcd.print("Smart Shed");
+    lcd.setCursor(0,1); lcd.print("Init sensors...");
+    delay(900);
+    lcd.clear();
+    lcdStarted = true;
+}
+void setupSensors() {
+    pinMode(RAIN_SENSOR_PIN, INPUT);
+    pinMode(RAIN_ANALOG_PIN, INPUT);
+    pinMode(LDR_SENSOR_PIN, INPUT);
+    pinMode(SWITCH_PIN, INPUT_PULLUP);
+}
+void setupMotor() {
+    pinMode(MOTOR_IN1, OUTPUT);
+    pinMode(MOTOR_IN2, OUTPUT);
+    digitalWrite(MOTOR_IN1, LOW);
+    digitalWrite(MOTOR_IN2, LOW);
+}
+void setupTimers() {
+    timer.setInterval(1000L, sendSensorData);
+    timer.setInterval(600000L, fetchWeather);
+    timer.setInterval(2000L, showFailSafeStatusOnLCD);
+}
+
+// ======================== WEATHER API INTEGRATION =========================
+void fetchWeather() {
+    Serial.println("\n=== [WEATHER API] FETCH ===");
+    if (!isWiFiConnected()) {
+        Serial.println("[WEATHER] WiFi missing! Weather: Unknown");
+        strncpy(weatherCondition, "Unknown", 15);
+        return;
+    }
+    HTTPClient http;
+    String url = String("https://api.tomorrow.io/v4/weather/realtime?location=") +
+                String(latitude, 6) + "," + String(longitude, 6) +
+                "&apikey=" + tomorrowAPIKey;
+    http.begin(url);
+    int httpCode = http.GET();
+    if (httpCode != 200) {
+        Serial.printf("[WEATHER] HTTP error: %d\n", httpCode);
+        strncpy(weatherCondition, "Unknown", 15); http.end(); return;
+    }
+    String payload = http.getString();
+    StaticJsonDocument<1024> doc;
+    DeserializationError error = deserializeJson(doc, payload);
+    if (error) {
+        Serial.println("[WEATHER] JSON failed"); Serial.println(payload);
+        strncpy(weatherCondition, "Unknown", 15); http.end(); return;
+    }
+    int code = doc["data"]["values"]["weatherCode"];
+    strncpy(weatherCondition, getWeatherDescription(code), 15);
+    weatherCondition[15] = '\0';
+    Serial.printf("[WEATHER] Code: %d | Condition: %s\n", code, weatherCondition);
+
+    if (strcmp(weatherCondition, lastWeatherCondition) != 0) {
+        String msg = String("Weather Update: ") + weatherCondition;
+        logEvent("weather_update", msg.c_str());
+        strncpy(lastWeatherCondition, weatherCondition, 15); lastWeatherCondition[15] = '\0';
+    }
+    http.end();
+}
+
+// ===================== LCD DISPLAY & UI FUNCTIONS =========================
+void updateLCDDisplay() {
+    static char prevWeather[16] = "";
+    static bool prevShedOpen = true;
+    static bool prevManualMode = false;
+    static char prevRain[12] = "";
+    const char* rainText = digitalRead(RAIN_SENSOR_PIN) == 0 ? "Rain" : "NoRn";
+    const char* modeText = manualMode ? "MAN " : "AUTO";
+    const char* lightText = digitalRead(LDR_SENSOR_PIN) == 0 ? "Br" : "Dr";
+    int rainPercent = getRainPercent();
+
+    if (
+        strcmp(prevWeather, weatherCondition) != 0 ||
+        shedOpen != prevShedOpen ||
+        manualMode != prevManualMode ||
+        strcmp(prevRain, rainText) != 0
+    ) {
+        lcd.clear();
+        lcd.setCursor(0,0);
+        lcd.print("Wx:"); lcd.print(weatherCondition);
+        lcd.print(" S:"); lcd.print(shedOpen ? "Op" : "Cl");
+        lcd.setCursor(0,1);
+        lcd.print(modeText);
+        lcd.print(" R:"); lcd.print(rainText);
+        lcd.print(" I:"); lcd.print(rainPercent); lcd.print("%");
+        Serial.printf("[LCD] Wx:%s S:%s %s R:%s Int:%d%% L:%s\n",
+            weatherCondition, shedOpen ? "Op":"Cl", modeText, rainText, rainPercent, lightText);
+
+        strncpy(prevWeather, weatherCondition, 15); prevWeather[15] = '\0';
+        prevShedOpen = shedOpen; prevManualMode = manualMode;
+        strncpy(prevRain, rainText, 11); prevRain[11] = '\0';
+    }
+}
+
+void updateBlynkStatus() {
+    static char prevShedStatus[8] = "", prevWeatherStatus[16] = "", prevRainStatus[16] = "", prevLightStatus[8] = "";
+    const char* shedStat = shedOpen ? "Open" : "Closed";
+    updateBlynkIfChanged(VPIN_WEATHER_STATUS, prevWeatherStatus, weatherCondition);
+    updateBlynkIfChanged(VPIN_SHED_STATUS, prevShedStatus, shedStat);
+    updateBlynkIfChanged(VPIN_RAIN_STATUS, prevRainStatus, getRainStatus());
+    updateBlynkIfChanged(VPIN_LIGHT_STATUS, prevLightStatus, getLightStatus());
+}
+
+// ========== MAIN DATA SAMPLING & LOGGING ==========
+void sendSensorData() {
+    updateBlynkStatus();
+    updateLCDDisplay();
+
+    int rainPercent = getRainPercent();
+    Blynk.virtualWrite(VPIN_RAIN_INTENSITY, rainPercent);
+
+    logToGoogleSheets(getRainStatus(), getLightStatus(), weatherCondition,
+        shedOpen ? "Open" : "Closed", manualMode ? "Manual" : "Auto", "SAMPLE");
+}
+
+// ===================== FAIL-SAFE & CLOUD INDICATOR ========================
+void showFailSafeStatusOnLCD() {
+    bool nowWifi = isWiFiConnected(), nowBlynk = isBlynkConnected();
+    if ((!nowWifi || !nowBlynk) && !lcdFailNotified) {
+        lcd.clear();
+        lcd.setCursor(0, 0); lcd.print(nowWifi ? "❌ Blynk Lost " : "❌ WiFi Lost ");
+        lcd.setCursor(0, 1); lcd.print("    Cloud Down   ");
+        lcdFailNotified = true;
+        Serial.println("[LCD] Cloud Fault Shown");
+    } else if (nowWifi && nowBlynk && lcdFailNotified) {
+        lcdFailNotified = false;
+        lcd.clear();
+        Serial.println("[LCD] Cloud Restored");
+    }
+    prevWiFiStatus = nowWifi; prevBlynkStatus = nowBlynk;
+}
+
+// ================= MOTOR CONTROL & COOLDOWN LOGIC =========================
+bool motorCooldownActive() { return millis() - lastMotorActionTime < motorCooldown; }
+void setMotorState(ShedState newState) {
+    if (shedState != IDLE) { Serial.println("[MOTOR] Ignored: Motor not idle"); return; }
+    if (motorCooldownActive()) { Serial.println("[MOTOR] Ignored: Cooldown active"); return; }
+    if (newState == OPENING && shedOpen) { Serial.println("[MOTOR] Ignored: Shed already open"); return; }
+    if (newState == CLOSING && !shedOpen) { Serial.println("[MOTOR] Ignored: Shed already closed"); return; }
+    if (newState == OPENING) {
+        digitalWrite(MOTOR_IN1, HIGH); digitalWrite(MOTOR_IN2, LOW);
+        Serial.println("[ACTION] 🚪 Shed Opening...");
+    } else if (newState == CLOSING) {
+        digitalWrite(MOTOR_IN1, LOW); digitalWrite(MOTOR_IN2, HIGH);
+        Serial.println("[ACTION] 🚪 Shed Closing...");
+    }
+    motorStartTime = millis();
+    lastMotorActionTime = millis();
+    shedState = newState;
+    pendingUpdate = true;
+}
+void openShed() { setMotorState(OPENING); }
+void closeShed() { setMotorState(CLOSING); }
+
+// ========== FALSE RAIN TRIGGER DEBOUNCE (Non-blocking) ====================
+void falseTriggerPrevention() {
+    int rainSensor = digitalRead(RAIN_SENSOR_PIN); // 0 = rain
+    if (rainCheckActive) {
+        if (millis() - rainCheckStart >= rainCheckDuration) {
+            if (digitalRead(RAIN_SENSOR_PIN) == 0) {
+                closeShed();
+                Serial.println("[FALSE_TRIG] Sensor steady 5s - Closing shed.");
+            } else {
+                Serial.println("[FALSE_TRIG] False alarm - Not closing.");
+            }
+            rainCheckActive = false;
+        }
+        return;
+    }
+    if (rainSensor == 0 && isWeatherAPIRain()) {
+        closeShed();
+        Serial.println("[FALSE_TRIG] Rain sensor+API detected rain. Shed closing.");
+    } else if (rainSensor == 0 && !isWeatherAPIRain()) {
+        Serial.println("[FALSE_TRIG] Rain sensor only, confirming 5s...");
+        rainCheckActive = true; rainCheckStart = millis();
+    }
+}
+
+// ============================== BLYNK CALLBACKS ===========================
+BLYNK_WRITE(VPIN_MANUAL_MODE) {
+    manualMode = param.asInt();
+    Serial.print("[BLYNK] Manual Mode toggled ");
+    Serial.println(manualMode ? "ON" : "OFF");
+}
+BLYNK_WRITE(VPIN_MANUAL_OPEN) {
+    if (manualMode && !shedOpen && param.asInt() == 1) {
+        Serial.println("[BLYNK] Manual Open button pressed");
+        openShed();
+    }
+}
+BLYNK_WRITE(VPIN_MANUAL_CLOSE) {
+    if (manualMode && shedOpen && param.asInt() == 1) {
+        Serial.println("[BLYNK] Manual Close button pressed");
+        closeShed();
+    }
+}
+BLYNK_WRITE(VPIN_START_HOUR) {
+    startHour = param.asInt();
+    Serial.print("[BLYNK] Start Hour set to: "); Serial.println(startHour);
+}
+BLYNK_WRITE(VPIN_END_HOUR) {
+    endHour = param.asInt();
+    Serial.print("[BLYNK] End Hour set to: "); Serial.println(endHour);
+}
+
+// ============================= SETUP() BLOCK ==============================
+void setup() {
+    Serial.begin(115200);
+    Serial.println("\n==============================");
+    Serial.println(" 🌧️  Smart Rain Shed Controller [TEST MODE]");
+    Serial.println("==============================");
+    Serial.printf("Boot Reason: %d (%s)\n", esp_reset_reason(), resetReasonToText(esp_reset_reason()));
+    Serial.println("----------------------------------");
+    setupSensors(); setupMotor(); Wire.begin();
+    setupLCD();
+    shedOpen = true;
+    Serial.println("[BOOT] Shed state = OPEN");
+    setupWiFi(); setupBlynk();
+
+    configTime(19800, 0, "pool.ntp.org", "time.nist.gov");
+    int ntpTries = 0;
+    Serial.print("[TIME] Syncing time");
+    while (!getLocalTime(&timeinfo) && ntpTries < 10) {
+        Serial.print("."); delay(500); ntpTries++;
+    }
+    Serial.println(getLocalTime(&timeinfo) ? " ✅" : " ❌ Using defaults.");
+    setupTimers(); fetchWeather(); startupTime = millis();
+    esp_task_wdt_init(10, true); esp_task_wdt_add(NULL);
+    lastLoopTime = millis();
+    Serial.println("=== SETUP DONE ===\n");
+}
+
+// ============================= MAIN LOOP ==================================
+void loop() {
+    esp_task_wdt_reset();
+
+    #if TEST_MODE
+    serialTestControl(); // allow test input from serial
+    #endif
+
+    unsigned long nowLoopTime = millis();
+    unsigned long loopDuration = nowLoopTime - lastLoopTime;
+    if (loopDuration > 500) {
+        Serial.printf("[WDT] Loop slow: %lu ms\n", loopDuration);
+    }
+    lastLoopTime = nowLoopTime;
+
+    Blynk.run(); timer.run();
+
+    // ------------- User controls: Hardware and App ------------------------
+    int rainVal = digitalRead(RAIN_SENSOR_PIN);
+    int lightVal = digitalRead(LDR_SENSOR_PIN);
+    bool switchState = digitalRead(SWITCH_PIN);
+
+    static unsigned long lastSwitchTrig = 0;
+    if (switchState == LOW && shedOpen && millis() - lastSwitchTrig > 1000) {
+        closeShed();
+        logEvent("shed_status", "User physical switch: Shed Closed");
+        logToGoogleSheets(getRainStatus(), getLightStatus(), weatherCondition,
+            shedOpen ? "Open" : "Closed", manualMode ? "Manual" : "Auto", "PHYS_CLOSED");
+        Serial.println("[SWITCH] 🟠 Manual Close Switch Activated");
+        lastSwitchTrig = millis();
+    }
+
+    if (!manualMode && switchState == HIGH && shedState == IDLE) {
+        if (millis() - autoModeLastCheck > autoCheckInterval) {
+            autoModeLastCheck = millis();
+            if (millis() - startupTime > 5000 && getLocalTime(&timeinfo)) {
+                int hourNow = timeinfo.tm_hour;
+                bool inTimeWindow = hourNow >= startHour && hourNow <= endHour;
+                if (inTimeWindow) {
+                    if (!lastTimeWindowStatus) { Serial.println("[AUTO] 🚦 Time window entered: Automation active."); lastTimeWindowStatus = true; }
+                    if (shedOpen) falseTriggerPrevention();
+                    else if (!shedOpen && rainVal == 1 && lightVal == 0) {
+                        openShed();
+                        Serial.println("[AUTO] ✅ Bright/No Rain, Shed Opening!");
+                    }
+                } else {
+                    if (lastTimeWindowStatus) { Serial.println("[AUTO] 📴 Out of auto time window, shed paused."); lastTimeWindowStatus = false; }
+                }
+            }
+        }
+    }
+    if (rainCheckActive) falseTriggerPrevention();
+
+    if ((shedState == OPENING || shedState == CLOSING) && millis() - motorStartTime >= motorRunDuration) {
+        digitalWrite(MOTOR_IN1, LOW); digitalWrite(MOTOR_IN2, LOW);
+        shedOpen = (shedState == OPENING);
+        shedState = IDLE;
+        updateLCDDisplay();
+        String event = shedOpen ? "SHED_OPENED" : "SHED_CLOSED";
+        String details = String("Shed ") + (shedOpen ? "Opened" : "Closed") +
+            " via " + (manualMode ? "Manual" : "Auto");
+        logEvent("shed_status", details.c_str());
+        logToGoogleSheets(getRainStatus(), getLightStatus(), weatherCondition,
+            shedOpen ? "Open" : "Closed", manualMode ? "Manual" : "Auto", event.c_str());
+        Serial.printf("[ACTION] 🏠 Shed %s!\n", shedOpen ? "OPENED" : "CLOSED");
+        pendingUpdate = false;
+    }
+
+    static unsigned long lastStatusPrint = 0;
+    if (millis() - lastStatusPrint > 4000 &&
+        (rainVal != lastRainVal || lightVal != lastLightVal || manualMode != lastManualMode || shedOpen != lastShedOpen)
+    ) {
+        Serial.println("\n---- [STATUS SNAPSHOT] ----");
+        Serial.print("Rain: ");   Serial.println(rainVal ? "No" : "YES");
+        Serial.print("Light: ");  Serial.println(lightVal ? "Dark" : "Bright");
+        Serial.print("Mode: ");   Serial.println(manualMode ? "MANUAL" : "AUTO");
+        Serial.print("Shed: ");   Serial.println(shedOpen ? "OPEN" : "CLOSED");
+        Serial.print("Rain %: "); Serial.println(getRainPercent());
+        Serial.println("---------------------------\n");
+        lastRainVal = rainVal;
+        lastLightVal = lightVal;
+        lastManualMode = manualMode;
+        lastShedOpen = shedOpen;
+        lastStatusPrint = millis();
+    }
+}
